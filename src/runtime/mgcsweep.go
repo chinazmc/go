@@ -179,6 +179,7 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 
 	// Mark any free objects in this span so we don't collect them.
 	sstart := uintptr(s.start << _PageShift)
+	// 为 span 中的空闲 object 设置标记， 无须再次扫描
 	for link := s.freelist; link.ptr() != nil; link = link.ptr().next {
 		if uintptr(link) < sstart || s.limit <= uintptr(link) {
 			// Free list is corrupted.
@@ -219,6 +220,7 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 	// the block bitmap without atomic operations.
 
 	size, n, _ := s.layout()
+	// 遍历 span， 收集未标记的不可达 object（ 不包括 freelist， 它们已被标记）
 	heapBitsSweepSpan(s.base(), size, n, func(p uintptr) {
 		// At this point we know that we are looking at garbage object
 		// that needs to be collected.
@@ -228,6 +230,7 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 
 		// Reset to allocated+noscan.
 		if cl == 0 {
+			// 大对象： 重置 bitmap， 更新 sweepgen
 			// Free large span.
 			if preserve {
 				throw("can't preserve large span")
@@ -248,6 +251,7 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 			} else if size > ptrSize {
 				*(*uintptr)(unsafe.Pointer(p + ptrSize)) = 0
 			}
+			// 使用 head、 end 构建链表， 收集不可达 object
 			if head.ptr() == nil {
 				head = gclinkptr(p)
 			} else {
@@ -255,6 +259,7 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 			}
 			end = gclinkptr(p)
 			end.ptr().next = gclinkptr(0x0bade5)
+			//收集计数
 			nfree++
 		}
 	})
@@ -276,6 +281,9 @@ func mSpan_Sweep(s *mspan, preserve bool) bool {
 		}
 		atomicstore(&s.sweepgen, sweepgen)
 	}
+	// 回收内存
+	// 小对象：如果没有可回收 object，那么维持原状态，根本无须处理
+	// 大对象：整个 span 就是一个 object，直接交还 heap
 	if nfree > 0 {
 		c.local_nsmallfree[cl] += uintptr(nfree)
 		res = mCentral_FreeSpan(&mheap_.central[cl].mcentral, s, int32(nfree), head, end, preserve)

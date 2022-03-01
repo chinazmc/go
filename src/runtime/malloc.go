@@ -214,6 +214,7 @@ const _MaxArena32 = 2 << 30
 // if accessed.  Used only for debugging the runtime.
 
 func mallocinit() {
+	// 初始化规格对照表
 	initSizes()
 
 	if class_to_size[_TinySizeClass] != _TinySize {
@@ -231,6 +232,7 @@ func mallocinit() {
 	// Set up the allocation arena, a contiguous area of memory where
 	// allocated data will be found.  The arena begins with a bitmap large
 	// enough to hold 4 bits per allocated word.
+	//64位系统
 	if ptrSize == 8 && (limit == 0 || limit > 1<<30) {
 		// On a 64-bit machine, allocate from a single contiguous reservation.
 		// 512 GB (MaxMem) should be big enough for now.
@@ -261,10 +263,13 @@ func mallocinit() {
 		// allocation at 0x40 << 32 because when using 4k pages with 3-level
 		// translation buffers, the user address space is limited to 39 bits
 		// On darwin/arm64, the address space is even smaller.
+		// 计算相关区域大小
 		arenaSize := round(_MaxMem, _PageSize)
 		bitmapSize = arenaSize / (ptrSize * 8 / 4)
 		spansSize = arenaSize / _PageSize * ptrSize
 		spansSize = round(spansSize, _PageSize)
+		// 尝试从 0xc000000000 开始设置保留地址
+		// 如果失败， 则尝试 0x1c000000000 ~ 0x7fc000000000
 		for i := 0; i <= 0x7f; i++ {
 			switch {
 			case GOARCH == "arm64" && GOOS == "darwin":
@@ -274,6 +279,7 @@ func mallocinit() {
 			default:
 				p = uintptr(i)<<40 | uintptrMask&(0x00c0<<32)
 			}
+			// 计算整个区域大小，并从指定位置开始保留地址空间
 			pSize = bitmapSize + spansSize + arenaSize + _PageSize
 			p = uintptr(sysReserve(unsafe.Pointer(p), pSize, &reserved))
 			if p != 0 {
@@ -344,8 +350,9 @@ func mallocinit() {
 	// PageSize can be larger than OS definition of page size,
 	// so SysReserve can give us a PageSize-unaligned pointer.
 	// To overcome this we ask for PageSize more and round up the pointer.
+	// 按页对齐
 	p1 := round(p, _PageSize)
-
+	// 保存相关属性
 	mheap_.spans = (**mspan)(unsafe.Pointer(p1))
 	mheap_.bitmap = p1 + spansSize
 	mheap_.arena_start = p1 + (spansSize + bitmapSize)
@@ -359,7 +366,9 @@ func mallocinit() {
 	}
 
 	// Initialize the rest of the allocator.
+	// 初始化 heap
 	mHeap_Init(&mheap_, spansSize)
+	// 为当前线程绑定 cache 对象
 	_g_ := getg()
 	_g_.m.mcache = allocmcache()
 }
@@ -419,13 +428,16 @@ func mHeap_SysAlloc(h *mheap, n uintptr) unsafe.Pointer {
 			}
 		}
 	}
-
+	// 不能超出 arena 大小限制
 	if n <= uintptr(h.arena_end)-uintptr(h.arena_used) {
 		// Keep taking from our reservation.
+		// 从指定位置申请内存
 		p := h.arena_used
 		sysMap((unsafe.Pointer)(p), n, h.arena_reserved, &memstats.heap_sys)
+		// 同步扩张 bitmap 和 spans 内存
 		mHeap_MapBits(h, p+n)
 		mHeap_MapSpans(h, p+n)
+		// 调整下一次申请地址
 		h.arena_used = p + n
 		if raceenabled {
 			racemapshadow((unsafe.Pointer)(p), n)
@@ -522,10 +534,13 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 
 	shouldhelpgc := false
 	dataSize := size
+	// 当前线程所绑定的 cache
 	c := gomcache()
 	var s *mspan
 	var x unsafe.Pointer
+	//小对象
 	if size <= maxSmallSize {
+		// 无须扫描非指针微小对象（ 小于 16）
 		if flags&flagNoScan != 0 && size < maxTinySize {
 			// Tiny allocator.
 			//
@@ -558,6 +573,7 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 			// reduces heap size by ~20%.
 			off := c.tinyoffset
 			// Align tiny pointer for required (conservative) alignment.
+			// 对齐， 调整偏移量
 			if size&7 == 0 {
 				off = round(off, 8)
 			} else if size&3 == 0 {
@@ -565,8 +581,10 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 			} else if size&1 == 0 {
 				off = round(off, 2)
 			}
+			// 如果剩余空间足够...
 			if off+size <= maxTinySize && c.tiny != nil {
 				// The object fits into existing tiny block.
+				// 返回指针， 调整偏移量为下次分配做好准备
 				x = add(c.tiny, off)
 				c.tinyoffset = off + size
 				c.local_tinyallocs++
@@ -574,32 +592,44 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 				releasem(mp)
 				return x
 			}
+			// 获取新的 tiny 块
+			// 就是从 sizeclass = 2 的 span.freelist 获取一个 16 字节 object
 			// Allocate a new maxTinySize block.
 			s = c.alloc[tinySizeClass]
 			v := s.freelist
+			// 如果没有可用的 object，那么需要从 central 获取新的 span
 			if v.ptr() == nil {
 				systemstack(func() {
 					mCache_Refill(c, tinySizeClass)
 				})
 				shouldhelpgc = true
+				// 重新提取 tiny 块
 				s = c.alloc[tinySizeClass]
 				v = s.freelist
 			}
+			// 提取 object 后，调整 span.freelist 链表，增加使用计数
 			s.freelist = v.ptr().next
 			s.ref++
 			// prefetchnta offers best performance, see change list message.
 			prefetchnta(uintptr(v.ptr().next))
+			// 初始化（零值） tiny 块
 			x = unsafe.Pointer(v)
 			(*[2]uint64)(x)[0] = 0
 			(*[2]uint64)(x)[1] = 0
 			// See if we need to replace the existing tiny block with the new one
 			// based on amount of remaining free space.
+			// 对比新旧两个 tiny 块的剩余空间
+			// 新块分配后，其 tinyoffset = size，因此比对偏移量即可
 			if size < c.tinyoffset {
+				//用新块替换
 				c.tiny = x
 				c.tinyoffset = size
 			}
+			//消费一个新的完整的tiny块
 			size = maxTinySize
 		} else {
+			// 普通小对象
+			// 查表，以确定 sizeclass
 			var sizeclass int8
 			if size <= 1024-8 {
 				sizeclass = size_to_class8[(size+7)>>3]
@@ -607,19 +637,24 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 				sizeclass = size_to_class128[(size-1024+127)>>7]
 			}
 			size = uintptr(class_to_size[sizeclass])
+			// 从对应规格的 span.freelist 提取 object
 			s = c.alloc[sizeclass]
 			v := s.freelist
+			// 没有可用的 object，从 central 获取新的 span
 			if v.ptr() == nil {
 				systemstack(func() {
 					mCache_Refill(c, int32(sizeclass))
 				})
 				shouldhelpgc = true
+				// 重新提取 object
 				s = c.alloc[sizeclass]
 				v = s.freelist
 			}
+			// 调整 span.freelist 链表，增加使用计数
 			s.freelist = v.ptr().next
 			s.ref++
 			// prefetchnta offers best performance, see change list message.
+			// 清零（变量默认总是初始化为零值）
 			prefetchnta(uintptr(v.ptr().next))
 			x = unsafe.Pointer(v)
 			if flags&flagNoZero == 0 {
@@ -631,15 +666,18 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 		}
 		c.local_cachealloc += size
 	} else {
+		// 大对象直接从 heap 分配 span
 		var s *mspan
 		shouldhelpgc = true
 		systemstack(func() {
 			s = largeAlloc(size, uint32(flags))
 		})
+		// span.start 实际由 address >> pageShift 生成
 		x = unsafe.Pointer(uintptr(s.start << pageShift))
 		size = uintptr(s.elemsize)
 	}
-
+	// 在 bitmap 做标记 ...
+	// 检查触发条件，启动垃圾回收 ...
 	if flags&flagNoScan != 0 {
 		// All objects are pre-marked as noscan. Nothing to do.
 	} else {
@@ -735,16 +773,17 @@ func largeAlloc(size uintptr, flag uint32) *mspan {
 	if size+_PageSize < size {
 		throw("out of memory")
 	}
+	// 计算所需页数
 	npages := size >> _PageShift
 	if size&_PageMask != 0 {
 		npages++
 	}
-
+	// 清理（ sweep）垃圾 ...
 	// Deduct credit for this span allocation and sweep if
 	// necessary. mHeap_Alloc will also sweep npages, so this only
 	// pays the debt down to npage pages.
 	deductSweepCredit(npages*_PageSize, npages)
-
+	// 从 heap 获取 span，并重置在 bitmap 里的标记
 	s := mHeap_Alloc(&mheap_, npages, 0, true, flag&_FlagNoZero == 0)
 	if s == nil {
 		throw("out of memory")
@@ -755,6 +794,7 @@ func largeAlloc(size uintptr, flag uint32) *mspan {
 }
 
 // implementation of new builtin
+// 内置函数 new 实现
 func newobject(typ *_type) unsafe.Pointer {
 	flags := uint32(0)
 	if typ.kind&kindNoPointers != 0 {
@@ -858,12 +898,13 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) unsafe.Pointer {
 	} else {
 		align = 8
 	}
-
+	// 直接分配大于 64KB 的内存块
 	if size >= maxBlock {
 		return sysAlloc(size, sysStat)
 	}
 
 	mp := acquirem()
+	// 后备内存块存放位置（本地或全局）
 	var persistent *persistentAlloc
 	if mp != nil && mp.p != 0 {
 		persistent = &mp.p.ptr().palloc
@@ -871,8 +912,11 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) unsafe.Pointer {
 		lock(&globalAlloc.mutex)
 		persistent = &globalAlloc.persistentAlloc
 	}
+	// 偏移位置对齐
 	persistent.off = round(persistent.off, align)
+	// 如果后备块空间不足，则重新申请
 	if persistent.off+size > chunk || persistent.base == nil {
+		// 申请新 256KB 后备内存
 		persistent.base = sysAlloc(chunk, &memstats.other_sys)
 		if persistent.base == nil {
 			if persistent == &globalAlloc.persistentAlloc {
@@ -882,6 +926,7 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) unsafe.Pointer {
 		}
 		persistent.off = 0
 	}
+	// 截取所需内存块
 	p := add(persistent.base, persistent.off)
 	persistent.off += size
 	releasem(mp)

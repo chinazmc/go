@@ -19,13 +19,13 @@ import "unsafe"
 // Callers can keep state in the object but the first word is
 // smashed by freeing and reallocating.
 type fixalloc struct {
-	size   uintptr
-	first  unsafe.Pointer // go func(unsafe.pointer, unsafe.pointer); f(arg, p) called first time p is returned
-	arg    unsafe.Pointer
-	list   *mlink
-	chunk  *byte
-	nchunk uint32
-	inuse  uintptr // in-use bytes now
+	size   uintptr        //固定分配长度
+	first  unsafe.Pointer // 关联函数// go func(unsafe.pointer, unsafe.pointer); f(arg, p) called first time p is returned
+	arg    unsafe.Pointer //关联函数调用参数
+	list   *mlink         //复用链表
+	chunk  *byte          //内存块指针
+	nchunk uint32         //内存块长度
+	inuse  uintptr        // in-use bytes now //内存块已用长度
 	stat   *uint64
 }
 
@@ -56,23 +56,25 @@ func fixAlloc_Alloc(f *fixalloc) unsafe.Pointer {
 		print("runtime: use of FixAlloc_Alloc before FixAlloc_Init\n")
 		throw("runtime: internal error")
 	}
-
+	// 尝试从可用链表提取
 	if f.list != nil {
 		v := unsafe.Pointer(f.list)
 		f.list = f.list.next
 		f.inuse += f.size
 		return v
 	}
+	// 如果剩余内存块已不足分配，则获取新内存块（ 16KB）
 	if uintptr(f.nchunk) < f.size {
 		f.chunk = (*uint8)(persistentalloc(_FixAllocChunk, 0, f.stat))
 		f.nchunk = _FixAllocChunk
 	}
-
+	// 获取新内存块时执行关联函数（通常用作初始化和拷贝数据）
 	v := (unsafe.Pointer)(f.chunk)
 	if f.first != nil {
 		fn := *(*func(unsafe.Pointer, unsafe.Pointer))(unsafe.Pointer(&f.first))
 		fn(f.arg, v)
 	}
+	// 更新属性
 	f.chunk = (*byte)(add(unsafe.Pointer(f.chunk), f.size))
 	f.nchunk -= uint32(f.size)
 	f.inuse += f.size

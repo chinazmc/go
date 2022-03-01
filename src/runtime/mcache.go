@@ -21,7 +21,7 @@ type mcache struct {
 	local_tinyallocs uintptr // number of tiny allocs not counted in other stats
 
 	// The rest is not accessed on every malloc.
-	alloc [_NumSizeClasses]*mspan // spans to allocate from
+	alloc [_NumSizeClasses]*mspan // spans to allocate from// 以 sizeclass 为索引管理多个用于分配的 span
 
 	stackcache [_NumStackOrders]stackfreelist
 
@@ -106,15 +106,17 @@ func mCache_Refill(c *mcache, sizeclass int32) *mspan {
 
 	_g_.m.locks++
 	// Return the current cached span to the central lists.
+	// 放弃当前正在使用的 span（尚在 central.empty 里）
 	s := c.alloc[sizeclass]
 	if s.freelist.ptr() != nil {
 		throw("refill on a nonempty span")
 	}
 	if s != &emptymspan {
-		s.incache = false
+		s.incache = false // 取消“正在使用” 标志
 	}
 
 	// Get a new cached span from the central lists.
+	// 从 central 获取 span 进行替换
 	s = mCentral_CacheSpan(&mheap_.central[sizeclass].mcentral)
 	if s == nil {
 		throw("out of memory")
